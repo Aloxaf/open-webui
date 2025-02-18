@@ -17,6 +17,7 @@ from typing import (
     Union
 )
 import aiohttp
+import requests
 import certifi
 import validators
 from langchain_community.document_loaders import (
@@ -24,8 +25,14 @@ from langchain_community.document_loaders import (
     WebBaseLoader
 )
 from langchain_core.documents import Document
+from langchain_core.document_loaders import BaseLoader
 from open_webui.constants import ERROR_MESSAGES
-from open_webui.config import ENABLE_RAG_LOCAL_WEB_FETCH, PLAYWRIGHT_WS_URI, RAG_WEB_LOADER_ENGINE
+from open_webui.config import (
+    ENABLE_RAG_LOCAL_WEB_FETCH,
+    PLAYWRIGHT_WS_URI,
+    RAG_WEB_LOADER_ENGINE,
+    JINA_API_KEY
+)
 from open_webui.env import SRC_LOG_LEVELS
 
 log = logging.getLogger(__name__)
@@ -351,9 +358,104 @@ class SafeWebBaseLoader(WebBaseLoader):
         """Load data into Document objects."""
         return [document async for document in self.alazy_load()]
 
+class JinaWebLoader(BaseLoader):
+    """WebBaseLoader with Jina integration."""
+
+    jina_reader_endpoint = "https://r.jina.ai/"
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+    def __init__(
+        self,
+        web_paths: List[str],
+        verify_ssl: bool = True,
+        requests_per_second: Optional[int] = None,
+        continue_on_failure: bool = True,
+        trust_env: bool = False,
+        jina_api_key: Optional[str] = None,
+    ):
+        super().__init__()
+        self.web_paths = web_paths
+        self.verify_ssl = verify_ssl
+        self.requests_per_second = requests_per_second
+        self.continue_on_failure = continue_on_failure
+        self.trust_env = trust_env
+        if jina_api_key:
+            self.headers["Authorization"] = f"Bearer {jina_api_key}"
+
+    def lazy_load(self) -> Iterator[Document]:
+        """Lazy load text from the url(s) in web_path with error handling."""
+        for path in self.web_paths:
+            try:
+                reponse = requests.post(self.jina_reader_endpoint, headers=self.headers, json={"url": path})
+                reponse.raise_for_status()
+                data = reponse.json()
+                metadata = { "source": path }
+                if data.get("title") and data["title"] != "":
+                    metadata["title"] = data["title"]
+                if data.get("description") and data["description"] != "":
+                    metadata["description"] = data["description"]
+                yield Document(page_content=data["content"], metadata=metadata)
+            except Exception as e:
+                if self.continue_on_failure:
+                    log.exception(e, "Error loading %s", path)
+                    continue
+                raise e
+
+    async def _fetch(self, url: str) -> dict:
+        async with aiohttp.ClientSession(trust_env=self.trust_env) as session:
+            async with session.post(
+                self.jina_reader_endpoint, headers=self.headers, json={"url": url}
+            ) as response:
+                response.raise_for_status()
+                return await response.json()
+
+    async def _fetch_with_rate_limit(
+        self, url: str, semaphore: asyncio.Semaphore
+    ) -> dict:
+        async with semaphore:
+            try:
+                return await self._fetch(url)
+            except Exception as e:
+                if self.continue_on_failure:
+                    log.warning(
+                        f"Error fetching {url}, skipping due to"
+                        f" continue_on_failure=True"
+                    )
+                    return ""
+                log.exception(
+                    f"Error fetching {url} and aborting, use continue_on_failure=True "
+                    "to continue loading urls after encountering an error."
+                )
+                raise e
+
+    async def fetch_all(self, urls: List[str]) -> list[dict]:
+        """Fetch all urls concurrently with rate limiting."""
+        semaphore = asyncio.Semaphore(self.requests_per_second)
+        tasks = []
+        for url in urls:
+            task = asyncio.ensure_future(self._fetch_with_rate_limit(url, semaphore))
+            tasks.append(task)
+        return await asyncio.gather(*tasks)
+
+    async def alazy_load(self) -> AsyncIterator[Document]:
+        """Async lazy load text from the url(s) in web_path."""
+        results = await self.fetch_all(self.web_paths)
+        for path, data in zip(self.web_paths, results):
+            metadata = {"source": path}
+            if data.get("title") and data["title"] != "":
+                metadata["title"] = data["title"]
+            if data.get("description") and data["description"] != "":
+                metadata["description"] = data["description"]
+            yield Document(page_content=data["content"], metadata=metadata)
+
+
 RAG_WEB_LOADER_ENGINES = defaultdict(lambda: SafeWebBaseLoader)
 RAG_WEB_LOADER_ENGINES["playwright"] = SafePlaywrightURLLoader
 RAG_WEB_LOADER_ENGINES["safe_web"] = SafeWebBaseLoader
+RAG_WEB_LOADER_ENGINES["jina"] = JinaWebLoader
 
 def get_web_loader(
     urls: Union[str, Sequence[str]],
@@ -374,6 +476,8 @@ def get_web_loader(
 
     if PLAYWRIGHT_WS_URI.value:
         web_loader_args["playwright_ws_url"] = PLAYWRIGHT_WS_URI.value
+    if JINA_API_KEY.value:
+        web_loader_args["jina_api_key"] = JINA_API_KEY.value
 
     # Create the appropriate WebLoader based on the configuration
     WebLoaderClass = RAG_WEB_LOADER_ENGINES[RAG_WEB_LOADER_ENGINE.value]
