@@ -410,7 +410,8 @@ class JinaWebLoader(BaseLoader):
                 self.jina_reader_endpoint, headers=self.headers, json={"url": url}
             ) as response:
                 response.raise_for_status()
-                return await response.json()
+                json = await response.json()
+                return json["data"]
 
     async def _fetch_with_rate_limit(
         self, url: str, semaphore: asyncio.Semaphore
